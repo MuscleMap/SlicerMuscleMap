@@ -6,22 +6,40 @@ import importlib.util
 import shutil
 import sys
 import glob
+import re
 import time
+import threading
+import queue
+import signal
+import csv
 
 import slicer
 import vtk, qt, ctk
 from slicer.ScriptedLoadableModule import *
+import ast
 import json
 import urllib.request
 import colorsys
 
 
+# Version of the SlicerMuscleMap extension. Bump this and tag the release
+# (git tag v<version>) when merging user-visible changes to main.
+__version__ = "1.0.0"
+
 MIN_PYTHON_VERSION = (3, 8)
 
-LABELS_JSON_URL = (
-    "https://raw.githubusercontent.com/MuscleMap/MuscleMap/main/scripts/models/wholebody/"
-    "contrast_agnostic_wholebody_model.json"
-)
+# MuscleMap downloads its models (.pth + .json) from Zenodo into
+# <site-packages>/scripts/models/<region>/v<version>/ on first use. The label
+# names are read from that json, so they always match the model mm_segment ran.
+# The available regions and versions come from ZENODO_MODELS in MuscleMap's
+# mm_util.py; this list is only used until MuscleMap is installed.
+DEFAULT_REGIONS = ["wholebody", "abdomen", "pelvis", "thigh", "leg", "forearm"]
+DEFAULT_REGION = "wholebody"
+LATEST_VERSION = "latest"
+
+
+def labels_json_filename(region: str) -> str:
+    return f"contrast_agnostic_{region}_model.json"
 
 
 class WholeBodyMuscleSegmentation(ScriptedLoadableModule):
@@ -34,13 +52,15 @@ class WholeBodyMuscleSegmentation(ScriptedLoadableModule):
         parent.contributors = ["Eddo Wesselink and Kenneth Arnold Weber"]
 
         parent.helpText = (
-            "MuscleMap provides automated whole-body muscle segmentation directly inside 3D Slicer.\n\n"
+            "MuscleMap provides automated muscle segmentation directly inside 3D Slicer.\n\n"
             "Features:\n"
             " • Fully automated whole-body muscle segmentation\n"
+            " • Regional models (abdomen, pelvis, thigh, leg, forearm) and selectable model versions\n"
             " • Support for CT and MRI\n"
-            " • Export of muscle labels for quantitative research workflows\n\n"
+            " • Export of labelled segmentations (NIfTI labelmap, CSV label table, color table)\n\n"
             "MuscleMap requires the SlicerPyTorch extension. After installation, all dependencies\n"
             "can be installed using the 'Install MuscleMap dependencies' button.\n\n"
+            f"SlicerMuscleMap version: {__version__}\n\n"
             "For documentation and source code, visit:\n"
             "https://github.com/MuscleMap/MuscleMap"
         )
@@ -81,7 +101,9 @@ class WholeBodyMuscleSegmentation(ScriptedLoadableModule):
 
 
 class WholeBodyMuscleSegmentationWidget(ScriptedLoadableModuleWidget):
-    """User interface for the MuscleMap whole-body segmentation module."""
+    """User interface for the MuscleMap segmentation module."""
+
+    SETTINGS_PREFIX = "MuscleMap/"
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
@@ -112,22 +134,6 @@ class WholeBodyMuscleSegmentationWidget(ScriptedLoadableModuleWidget):
         self.installButton.connect("clicked()", self.onInstallClicked)
         packagesLayout.addWidget(self.installButton)
 
-        advancedCollapsibleButton = ctk.ctkCollapsibleButton()
-        advancedCollapsibleButton.text = "Advanced"
-        self.layout.addWidget(advancedCollapsibleButton)
-
-        advancedLayout = qt.QFormLayout(advancedCollapsibleButton)
-
-        self.forceCpuCheckBox = qt.QCheckBox("Force CPU (ignore GPU)")
-        self.forceCpuCheckBox.setToolTip("If checked, MuscleMap will run on the CPU even if a GPU is available.")
-        self.forceCpuCheckBox.checked = False
-        advancedLayout.addRow(self.forceCpuCheckBox)
-
-        self.forceLowerOverlapCheckBox = qt.QCheckBox("Force lower overlap")
-        self.forceLowerOverlapCheckBox.setToolTip("If checked, run mm_segment with -s 75. Otherwise uses -s 90.")
-        self.forceLowerOverlapCheckBox.checked = False
-        advancedLayout.addRow(self.forceLowerOverlapCheckBox)
-
         parametersCollapsibleButton = ctk.ctkCollapsibleButton()
         parametersCollapsibleButton.text = "Inputs"
         self.layout.addWidget(parametersCollapsibleButton)
@@ -149,8 +155,47 @@ class WholeBodyMuscleSegmentationWidget(ScriptedLoadableModuleWidget):
         self.inputSelector.showHidden = False
         self.inputSelector.showChildNodeTypes = False
         self.inputSelector.setMRMLScene(slicer.mrmlScene)
-        self.inputSelector.setToolTip("Select the input whole-body image.")
+        self.inputSelector.setToolTip("Select the input image.")
         parametersFormLayout.addRow("Input volume:", self.inputSelector)
+
+        self.regionComboBox = qt.QComboBox()
+        self.regionComboBox.setToolTip(
+            "Anatomical region model to segment with (mm_segment -r). "
+            "The model is downloaded from Zenodo and cached on first use."
+        )
+        parametersFormLayout.addRow("Model:", self.regionComboBox)
+
+        self.versionComboBox = qt.QComboBox()
+        self.versionComboBox.setToolTip(
+            "Model version to use (mm_segment --model_version). "
+            "'latest' always uses the newest version available on Zenodo."
+        )
+        parametersFormLayout.addRow("Model version:", self.versionComboBox)
+
+        advancedCollapsibleButton = ctk.ctkCollapsibleButton()
+        advancedCollapsibleButton.text = "Advanced"
+        advancedCollapsibleButton.collapsed = True
+        self.layout.addWidget(advancedCollapsibleButton)
+
+        advancedLayout = qt.QFormLayout(advancedCollapsibleButton)
+
+        self.forceCpuCheckBox = qt.QCheckBox("Force CPU (ignore GPU)")
+        self.forceCpuCheckBox.setToolTip("If checked, MuscleMap will run on the CPU even if a GPU is available.")
+        self.forceCpuCheckBox.checked = False
+        advancedLayout.addRow(self.forceCpuCheckBox)
+
+        self.forceLowerOverlapCheckBox = qt.QCheckBox("Force lower overlap")
+        self.forceLowerOverlapCheckBox.setToolTip("If checked, run mm_segment with -s 75. Otherwise uses -s 90.")
+        self.forceLowerOverlapCheckBox.checked = False
+        advancedLayout.addRow(self.forceLowerOverlapCheckBox)
+
+        self.rememberSettingsCheckBox = qt.QCheckBox("Remember settings")
+        self.rememberSettingsCheckBox.setToolTip(
+            "If checked, the selected model, model version and advanced options "
+            "are restored the next time Slicer is started."
+        )
+        self.rememberSettingsCheckBox.checked = False
+        advancedLayout.addRow(self.rememberSettingsCheckBox)
 
         self.runButton = qt.QPushButton("Run MuscleMap segmentation")
         self.runButton.toolTip = "Run mm_segment on the selected volume."
@@ -172,12 +217,20 @@ class WholeBodyMuscleSegmentationWidget(ScriptedLoadableModuleWidget):
         self.outputSegmentationSelector.showHidden = False
         self.outputSegmentationSelector.showChildNodeTypes = False
         self.outputSegmentationSelector.setMRMLScene(slicer.mrmlScene)
-        self.outputSegmentationSelector.setToolTip("Select the segmentation for 3D visualization.")
+        self.outputSegmentationSelector.setToolTip("Select the segmentation for 3D visualization and export.")
         outputsLayout.addRow("Segmentation:", self.outputSegmentationSelector)
 
         self.show3DButton = slicer.qMRMLSegmentationShow3DButton()
         self.show3DButton.setToolTip("Show 3D representation of the selected segmentation.")
         outputsLayout.addRow(self.show3DButton)
+
+        self.exportButton = qt.QPushButton("Export segmentation...")
+        self.exportButton.toolTip = (
+            "Save the selected segmentation as a NIfTI labelmap with the original MuscleMap "
+            "label values, together with a CSV label table and a Slicer color table."
+        )
+        self.exportButton.connect("clicked()", self.onExportClicked)
+        outputsLayout.addRow(self.exportButton)
 
         self.outputSegmentationSelector.connect(
             "currentNodeChanged(vtkMRMLNode*)",
@@ -185,6 +238,86 @@ class WholeBodyMuscleSegmentationWidget(ScriptedLoadableModuleWidget):
         )
 
         self.layout.addStretch(1)
+
+        self.regionComboBox.connect("currentIndexChanged(int)", self.updateVersionComboBox)
+        self.updateModelComboBoxes()
+        self.restoreSettings()
+
+        self.regionComboBox.connect("currentIndexChanged(int)", self.saveSettings)
+        self.versionComboBox.connect("currentIndexChanged(int)", self.saveSettings)
+        self.forceCpuCheckBox.connect("toggled(bool)", self.saveSettings)
+        self.forceLowerOverlapCheckBox.connect("toggled(bool)", self.saveSettings)
+        self.rememberSettingsCheckBox.connect("toggled(bool)", self.saveSettings)
+
+    # --- settings -------------------------------------------------------
+
+    def restoreSettings(self):
+        settings = qt.QSettings()
+        remember = settings.value(self.SETTINGS_PREFIX + "rememberSettings", False)
+        remember = str(remember).lower() in ("true", "1")
+        self.rememberSettingsCheckBox.checked = remember
+        if not remember:
+            return
+
+        region = settings.value(self.SETTINGS_PREFIX + "region", DEFAULT_REGION)
+        index = self.regionComboBox.findText(str(region))
+        if index >= 0:
+            self.regionComboBox.setCurrentIndex(index)
+
+        version = settings.value(self.SETTINGS_PREFIX + "modelVersion", LATEST_VERSION)
+        index = self.versionComboBox.findText(str(version))
+        if index >= 0:
+            self.versionComboBox.setCurrentIndex(index)
+
+        for key, checkBox in (("forceCpu", self.forceCpuCheckBox),
+                              ("forceLowerOverlap", self.forceLowerOverlapCheckBox)):
+            value = settings.value(self.SETTINGS_PREFIX + key, False)
+            checkBox.checked = str(value).lower() in ("true", "1")
+
+    def saveSettings(self, _value=None):
+        settings = qt.QSettings()
+        remember = bool(self.rememberSettingsCheckBox.isChecked())
+        settings.setValue(self.SETTINGS_PREFIX + "rememberSettings", remember)
+        if not remember:
+            for key in ("region", "modelVersion", "forceCpu", "forceLowerOverlap"):
+                settings.remove(self.SETTINGS_PREFIX + key)
+            return
+        settings.setValue(self.SETTINGS_PREFIX + "region", self.regionComboBox.currentText)
+        settings.setValue(self.SETTINGS_PREFIX + "modelVersion", self.versionComboBox.currentText)
+        settings.setValue(self.SETTINGS_PREFIX + "forceCpu", bool(self.forceCpuCheckBox.isChecked()))
+        settings.setValue(self.SETTINGS_PREFIX + "forceLowerOverlap", bool(self.forceLowerOverlapCheckBox.isChecked()))
+
+    # --- model selection ------------------------------------------------
+
+    def updateModelComboBoxes(self):
+        """(Re)fill the region list from the installed MuscleMap package, keeping the current choice."""
+        self.availableModels = self.logic.getAvailableModels()
+        current = self.regionComboBox.currentText or DEFAULT_REGION
+
+        wasBlocked = self.regionComboBox.blockSignals(True)
+        self.regionComboBox.clear()
+        for region in self.availableModels:
+            self.regionComboBox.addItem(region)
+        index = self.regionComboBox.findText(current)
+        self.regionComboBox.setCurrentIndex(index if index >= 0 else 0)
+        self.regionComboBox.blockSignals(wasBlocked)
+
+        self.updateVersionComboBox()
+
+    def updateVersionComboBox(self, _index=None):
+        versions = self.availableModels.get(self.regionComboBox.currentText, [])
+        current = self.versionComboBox.currentText
+
+        self.versionComboBox.clear()
+        self.versionComboBox.addItem(LATEST_VERSION)
+        for version in versions:
+            self.versionComboBox.addItem(version)
+        index = self.versionComboBox.findText(current)
+        self.versionComboBox.setCurrentIndex(index if index >= 0 else 0)
+        # Regions without published versions only offer 'latest'
+        self.versionComboBox.setEnabled(bool(versions))
+
+    # --- actions --------------------------------------------------------
 
     def onLoadFromFileClicked(self):
         fileFilters = (
@@ -238,6 +371,7 @@ class WholeBodyMuscleSegmentationWidget(ScriptedLoadableModuleWidget):
 
         try:
             self.logic.ensureDependencies()
+            self.updateModelComboBoxes()
             progress.close()
             slicer.util.infoDisplay("MuscleMap dependencies are installed and ready.")
         except Exception as e:
@@ -250,8 +384,10 @@ class WholeBodyMuscleSegmentationWidget(ScriptedLoadableModuleWidget):
             slicer.util.errorDisplay("Please select an input volume first.")
             return
 
-        force_cpu = bool(self.forceCpuCheckBox.isChecked()) if hasattr(self, "forceCpuCheckBox") else False
-        force_lower_overlap = bool(self.forceLowerOverlapCheckBox.isChecked()) if hasattr(self, "forceLowerOverlapCheckBox") else False
+        force_cpu = bool(self.forceCpuCheckBox.isChecked())
+        force_lower_overlap = bool(self.forceLowerOverlapCheckBox.isChecked())
+        region = self.regionComboBox.currentText or DEFAULT_REGION
+        model_version = self.versionComboBox.currentText or LATEST_VERSION
 
         try:
             import torch
@@ -262,67 +398,232 @@ class WholeBodyMuscleSegmentationWidget(ScriptedLoadableModuleWidget):
         except Exception:
             device = "CPU"
 
-        msg = (
-            "Running MuscleMap whole-body segmentation.\n"
-            f"Computation device: {device}.\n"
+        header = (
+            f"MuscleMap {region} segmentation (model version: {model_version}, extension {__version__})\n"
+            f"Computation device: {device}\n"
         )
-
         if device.startswith("CPU"):
-            msg += "\nNote: Processing on CPU may be slow, depending on image size and system performance."
-
-        if force_lower_overlap:
-            msg += "\nOptional setting enabled: overlap is lowered (mm_segment -s 75)."
-        else:
-            msg += "\nTip: For segmentation issues related to processing speed, enable 'Force lower overlap' (mm_segment -s 75)."
-
-        msg += (
-            "\n\nIf you use MuscleMap models for research, "
-            "please cite the MuscleMap publications (see module Acknowledgements)."
+            header += (
+                "\nNote: processing on the CPU can be slow. Enabling 'Force lower overlap' "
+                "under Advanced reduces the processing time.\n"
+            )
+        header += (
+            "\nIf you use MuscleMap for research, please cite the MuscleMap publications "
+            "(see module Acknowledgements).\n"
         )
+        logging.info(f"[MuscleMap] {header.replace(os.linesep, ' ')}")
 
-        logging.info(f"[MuscleMap] {msg.replace(os.linesep, ' ')}")
-
-        progress = qt.QProgressDialog(msg, None, 0, 0, slicer.util.mainWindow())
-        progress.setCancelButtonText("Cancel")
+        progress = qt.QProgressDialog("", "Cancel", 0, 0, slicer.util.mainWindow())
         progress.windowTitle = "MuscleMap segmentation"
         progress.setWindowModality(qt.Qt.WindowModal)
         progress.setMinimumDuration(0)
+        progress.setMinimumWidth(500)
+
+        def setStatus(status):
+            progress.labelText = header + "\n" + status
+            slicer.app.processEvents()
+
+        setStatus("Preparing the model. If it is not yet available locally, it is downloaded from Zenodo. "
+                  "This may take a while.")
         progress.show()
         slicer.app.processEvents()
 
+        self.runButton.enabled = False
         try:
             segNode = self.logic.runSegmentation(
                 inputVolume,
                 force_cpu=force_cpu,
-                force_lower_overlap=force_lower_overlap
+                force_lower_overlap=force_lower_overlap,
+                region=region,
+                model_version=model_version,
+                statusCallback=setStatus,
+                cancelRequested=lambda: progress.wasCanceled,
             )
+            progress.close()
             if segNode:
                 self.outputSegmentationSelector.setCurrentNode(segNode)
                 self.show3DButton.setSegmentationNode(segNode)
+                slicer.util.infoDisplay(f"MuscleMap {region} segmentation completed.")
+        except SegmentationCancelled:
+            progress.close()
+            slicer.util.infoDisplay("MuscleMap segmentation was cancelled.")
         except Exception as e:
+            progress.close()
             slicer.util.errorDisplay(f"Segmentation failed:\n{e}")
         finally:
             progress.close()
+            self.runButton.enabled = True
+
+    def onExportClicked(self):
+        segmentationNode = self.outputSegmentationSelector.currentNode()
+        if not segmentationNode:
+            slicer.util.errorDisplay("Please select a segmentation to export first.")
+            return
+
+        filePath = qt.QFileDialog.getSaveFileName(
+            slicer.util.mainWindow(),
+            "Export segmentation",
+            self.logic.defaultExportPath(segmentationNode),
+            "NIfTI labelmap (*.nii.gz)",
+        )
+        if not filePath:
+            return
+
+        try:
+            written = self.logic.exportSegmentation(segmentationNode, filePath)
+        except Exception as e:
+            slicer.util.errorDisplay(f"Export failed:\n{e}")
+            return
+
+        msg = "Exported:\n" + "\n".join(f"  {p}" for p in written)
+        if not segmentationNode.GetNodeReference(self.logic.COLOR_TABLE_REFERENCE_ROLE):
+            msg += (
+                "\n\nNote: this segmentation was not created by MuscleMap, so the label values "
+                "in the labelmap are numbered consecutively."
+            )
+        slicer.util.infoDisplay(msg, windowTitle="MuscleMap export")
+
+
+class SegmentationCancelled(Exception):
+    """Raised when the user cancels a running segmentation."""
 
 
 class WholeBodyMuscleSegmentationLogic(ScriptedLoadableModuleLogic):
-    """Processing code for the MuscleMap whole-body segmentation module."""
+    """Processing code for the MuscleMap segmentation module."""
 
-    def _fetch_labels_json(self, url: str) -> dict:
-        req = urllib.request.Request(url, headers={"User-Agent": "3D Slicer MuscleMap"})
+    # Node reference from a MuscleMap segmentation to its color table (label values + names)
+    COLOR_TABLE_REFERENCE_ROLE = "MuscleMapColorTable"
+    # Segmentation node attribute holding the model's label list as JSON
+    LABELS_ATTRIBUTE = "MuscleMap.Labels"
+
+    def _fetch_json(self, url: str):
+        req = urllib.request.Request(url, headers={"User-Agent": f"SlicerMuscleMap/{__version__}"})
         with urllib.request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def _build_colortable_from_labels_json(self):
-        data = self._fetch_labels_json(LABELS_JSON_URL)
+    @staticmethod
+    def _version_key(version: str):
+        try:
+            return tuple(int(x) for x in version.split("."))
+        except ValueError:
+            return ()
+
+    def _musclemap_package_dirs(self):
+        """Directories of the installed MuscleMap package ('scripts'), without importing it."""
+        spec = importlib.util.find_spec("scripts")
+        if spec is None or not spec.submodule_search_locations:
+            return []
+        return [d for d in spec.submodule_search_locations if os.path.isfile(os.path.join(d, "mm_util.py"))]
+
+    def _musclemap_supports_regions(self) -> bool:
+        """True if the installed MuscleMap downloads region models from Zenodo (has ZENODO_MODELS)."""
+        for pkgDir in self._musclemap_package_dirs():
+            try:
+                with open(os.path.join(pkgDir, "mm_util.py"), encoding="utf-8") as f:
+                    if "ZENODO_MODELS" in f.read():
+                        return True
+            except OSError:
+                continue
+        return False
+
+    def _read_zenodo_models(self) -> dict:
+        """Read the ZENODO_MODELS table from the installed mm_util.py.
+
+        mm_util imports torch/monai, so it is parsed instead of imported. Returns
+        {} if MuscleMap is not installed, predates the Zenodo model download, or
+        the table cannot be parsed (the UI then falls back to DEFAULT_REGIONS).
+        """
+        for pkgDir in self._musclemap_package_dirs():
+            try:
+                with open(os.path.join(pkgDir, "mm_util.py"), encoding="utf-8") as f:
+                    tree = ast.parse(f.read())
+            except (OSError, SyntaxError) as e:
+                logging.warning(f"[MuscleMap] Could not parse mm_util.py: {e}")
+                continue
+            for node in tree.body:
+                if isinstance(node, ast.AnnAssign):
+                    targets = [node.target]
+                elif isinstance(node, ast.Assign):
+                    targets = node.targets
+                else:
+                    continue
+                if any(isinstance(t, ast.Name) and t.id == "ZENODO_MODELS" for t in targets):
+                    try:
+                        return ast.literal_eval(node.value)
+                    except ValueError:
+                        return {}
+        return {}
+
+    def getAvailableModels(self) -> dict:
+        """Return {region: [versions, newest first]} that mm_segment can download."""
+        zenodo_models = self._read_zenodo_models()
+        if not zenodo_models:
+            return {region: [] for region in DEFAULT_REGIONS}
+        regions = sorted(zenodo_models, key=lambda r: (r != DEFAULT_REGION, r))
+        return {
+            region: sorted(zenodo_models[region].get("versions", {}), key=self._version_key, reverse=True)
+            for region in regions
+        }
+
+    def _find_cached_labels_json(self, region: str, model_version: str = LATEST_VERSION, mm_segment_log: str = ""):
+        """Locate the model json for *region* in MuscleMap's local model cache.
+
+        Prefers the version mm_segment reported in its log, then the requested
+        version, otherwise the highest cached version. Returns None if nothing is cached.
+        """
+        jsonFilename = labels_json_filename(region)
+        candidates = {}  # version folder name -> path
+        for pkgDir in self._musclemap_package_dirs():
+            regionDir = os.path.join(pkgDir, "models", region)
+            for path in glob.glob(os.path.join(regionDir, "v*", jsonFilename)):
+                candidates[os.path.basename(os.path.dirname(path))] = path
+            # Pre-Zenodo MuscleMap installs shipped the json without a version folder
+            legacy = os.path.join(regionDir, jsonFilename)
+            if os.path.isfile(legacy):
+                candidates.setdefault("", legacy)
+        if not candidates:
+            return None
+
+        m = re.search(rf"'{re.escape(region)}' model v(\d+(?:\.\d+)*)", mm_segment_log)
+        for wanted in ([m.group(1)] if m else []) + [model_version]:
+            if f"v{wanted}" in candidates:
+                return candidates[f"v{wanted}"]
+
+        return candidates[max(candidates, key=lambda name: self._version_key(name[1:]))]
+
+    def _load_labels_json(self, region: str, model_version: str = LATEST_VERSION, mm_segment_log: str = "") -> dict:
+        path = self._find_cached_labels_json(region, model_version, mm_segment_log)
+        if path:
+            logging.info(f"[MuscleMap] Reading label names from {path}")
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+
+        # Fallback: fetch the json directly from Zenodo
+        model_info = self._read_zenodo_models().get(region)
+        if not model_info:
+            raise RuntimeError(f"No cached model json and no Zenodo record known for region '{region}'.")
+        logging.info(f"[MuscleMap] No cached model json found, fetching '{region}' label names from Zenodo...")
+        version_record_id = model_info.get("versions", {}).get(model_version)
+        if version_record_id:
+            url = f"https://zenodo.org/api/records/{version_record_id}"
+        else:
+            url = f"https://zenodo.org/api/records/{model_info['record_id']}/versions/latest"
+        jsonFilename = labels_json_filename(region)
+        for f in self._fetch_json(url).get("files", []):
+            if f.get("key") == jsonFilename:
+                return self._fetch_json(f["links"]["self"])
+        raise RuntimeError(f"'{jsonFilename}' not found in the Zenodo record.")
+
+    def _build_colortable_from_labels_json(self, region: str, model_version: str = LATEST_VERSION, mm_segment_log: str = ""):
+        data = self._load_labels_json(region, model_version, mm_segment_log)
         labels = data.get("labels", [])
         if not labels:
-            raise RuntimeError("No 'labels' found in wholebody model json.")
+            raise RuntimeError(f"No 'labels' found in {region} model json.")
 
         labels_sorted = sorted(labels, key=lambda x: int(x["value"]))
         max_value = max(int(x["value"]) for x in labels_sorted)
 
-        colorNodeName = "MuscleMapWholeBody_ColorTable"
+        colorNodeName = f"MuscleMap_{region}_ColorTable"
 
         try:
             colorNode = slicer.util.getNode(colorNodeName)
@@ -335,6 +636,9 @@ class WholeBodyMuscleSegmentationLogic(ScriptedLoadableModuleLogic):
             colorNode.SetTypeToUser()
 
         colorNode.SetNumberOfColors(max_value + 1)
+        # A reused table may still hold entries of another model version
+        for value in range(max_value + 1):
+            colorNode.SetColor(value, "", 0.0, 0.0, 0.0, 0.0)
 
         # Background
         colorNode.SetColor(0, "background", 0.0, 0.0, 0.0, 0.0)
@@ -375,7 +679,7 @@ class WholeBodyMuscleSegmentationLogic(ScriptedLoadableModuleLogic):
 
             colorNode.SetColor(label_value, name, float(r), float(g), float(b), 1.0)
 
-        return colorNode
+        return colorNode, labels_sorted
 
     def ensureDependencies(self):
         if sys.version_info < MIN_PYTHON_VERSION:
@@ -424,11 +728,18 @@ class WholeBodyMuscleSegmentationLogic(ScriptedLoadableModuleLogic):
             )
 
         import torch  # noqa: F401
-        have_mm_segment = shutil.which("mm_segment") is not None
+        # Look for the MuscleMap package in Slicer's Python rather than for the
+        # `mm_segment` entry point on PATH: PATH may hold another installation.
+        # Versions from before the Zenodo model download do not support region
+        # models / --model_version; treat those as missing so they get upgraded.
+        have_musclemap = bool(self._musclemap_package_dirs())
+        if have_musclemap and not self._musclemap_supports_regions():
+            logging.info("[MuscleMap] Installed MuscleMap package is outdated, it will be upgraded.")
+            have_musclemap = False
 
         if all([
             have_monai, have_nibabel, have_torch, have_sklearn, have_scipy,
-            have_tqdm, have_psutil, have_pandas, have_mm_segment
+            have_tqdm, have_psutil, have_pandas, have_musclemap
         ]):
             logging.info("[MuscleMap] All dependencies already present, nothing to install.")
             return
@@ -485,15 +796,108 @@ class WholeBodyMuscleSegmentationLogic(ScriptedLoadableModuleLogic):
         # which would clobber the Slicer-managed builds. We only need its
         # `mm_segment` entry point here; everything mm_segment imports is provided
         # by segmentation_packages above.
-        if not have_mm_segment:
+        if not have_musclemap:
             logging.info("[MuscleMap] Installing MuscleMap package (no deps)...")
-            slicer.util.pip_install(["--no-deps", "git+https://github.com/MuscleMap/MuscleMap.git"])
+            # --force-reinstall: an outdated install may carry the same package version
+            slicer.util.pip_install([
+                "--no-deps", "--upgrade", "--force-reinstall",
+                "git+https://github.com/MuscleMap/MuscleMap.git",
+            ])
         else:
-            logging.info("[MuscleMap] mm_segment already found, skipping MuscleMap install.")
+            logging.info("[MuscleMap] MuscleMap package already installed, skipping.")
 
         logging.info("[MuscleMap] Dependency check/installation finished.")
 
-    def runSegmentation(self, inputVolumeNode, force_cpu: bool = False, force_lower_overlap: bool = False):
+    def _killProcessTree(self, proc):
+        """Stop mm_segment. sys.executable is the Slicer launcher, so its child must go too."""
+        if proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception as e:
+            logging.warning(f"[MuscleMap] Could not stop mm_segment process tree: {e}")
+            proc.kill()
+        proc.wait()
+
+    def _runProcess(self, cmd, cwd, env, statusCallback=None, cancelRequested=None) -> str:
+        """Run *cmd* without blocking the Slicer UI; returns the combined output.
+
+        Lines are logged as they arrive, the status callback is updated on
+        model download / inference start, and the process is stopped when
+        cancelRequested() returns True.
+        """
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=cwd,
+            env=env,
+            startupinfo=startupinfo,
+            start_new_session=(os.name != "nt"),
+        )
+
+        lines = queue.Queue()
+
+        def reader():
+            for line in iter(proc.stdout.readline, ""):
+                lines.put(line)
+            proc.stdout.close()
+
+        readerThread = threading.Thread(target=reader, daemon=True)
+        readerThread.start()
+
+        output = []
+
+        def drain():
+            while True:
+                try:
+                    line = lines.get_nowait()
+                except queue.Empty:
+                    return
+                output.append(line)
+                logging.info("[mm_segment] " + line.rstrip())
+                if not statusCallback:
+                    continue
+                if "Downloading" in line and "Zenodo" in line:
+                    statusCallback("Downloading the model from Zenodo. This may take a while.")
+                elif "Task: Segmentation" in line:
+                    statusCallback("Running the segmentation. This may take several minutes.")
+
+        while proc.poll() is None:
+            drain()
+            if cancelRequested and cancelRequested():
+                logging.info("[MuscleMap] Segmentation cancelled by user, stopping mm_segment.")
+                self._killProcessTree(proc)
+                raise SegmentationCancelled()
+            slicer.app.processEvents()
+            time.sleep(0.1)
+
+        readerThread.join(timeout=5.0)
+        drain()
+        return "".join(output)
+
+    def runSegmentation(
+        self,
+        inputVolumeNode,
+        force_cpu: bool = False,
+        force_lower_overlap: bool = False,
+        region: str = DEFAULT_REGION,
+        model_version: str = LATEST_VERSION,
+        statusCallback=None,
+        cancelRequested=None,
+    ):
         if not inputVolumeNode:
             raise ValueError("No input volume node provided.")
 
@@ -501,102 +905,228 @@ class WholeBodyMuscleSegmentationLogic(ScriptedLoadableModuleLogic):
 
         tempDir = tempfile.mkdtemp(prefix="MuscleMap_")
         inputPath = os.path.join(tempDir, "input.nii.gz")
+        outputDir = os.path.join(tempDir, "output")
 
         logging.info(f"[MuscleMap] Saving input volume to: {inputPath}")
         if not slicer.util.saveNode(inputVolumeNode, inputPath):
             raise RuntimeError(f"Failed to save input volume to {inputPath}")
 
+        # Run mm_segment with Slicer's own interpreter instead of relying on the
+        # `mm_segment` entry point being on PATH: this guarantees the package we
+        # installed (and read the label names from) is the one that runs.
         s_value = "75" if force_lower_overlap else "90"
-        cmd = ["mm_segment", "-i", inputPath, "-s", s_value]
+        cmd = [sys.executable, "-m", "scripts.mm_segment", "-i", inputPath, "-o", outputDir, "-s", s_value]
         cmd.extend(["-g", "N" if force_cpu else "Y"])
+        cmd.extend(["-r", region])
+        if model_version and model_version != LATEST_VERSION:
+            cmd.extend(["--model_version", model_version])
 
         logging.info("[MuscleMap] Running command: " + " ".join(cmd))
 
         env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
         if force_cpu:
             env["CUDA_VISIBLE_DEVICES"] = ""
             logging.info("[MuscleMap] Forcing CPU execution (CUDA_VISIBLE_DEVICES='').")
 
-        t0 = time.time()
+        try:
+            output = self._runProcess(cmd, tempDir, env, statusCallback, cancelRequested)
+        except SegmentationCancelled:
+            shutil.rmtree(tempDir, ignore_errors=True)
+            raise
 
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-            cwd=tempDir,
-            env=env,
-        )
-        logging.info("[MuscleMap] mm_segment stdout:\n" + result.stdout)
-        logging.info("[MuscleMap] mm_segment stderr:\n" + result.stderr)
-
-        if result.returncode != 0:
-            raise RuntimeError("mm_segment failed with non-zero exit code.\n\n" + result.stderr)
-
-        # --- NEW: zoek output recursief (ook in subfolders), en accepteer evt .nrrd ---
-        candidates = []
-        for ext in ("*.nii", "*.nii.gz", "*.nrrd"):
-            candidates.extend(glob.glob(os.path.join(tempDir, "**", ext), recursive=True))
-
-        # input zelf uitsluiten
-        candidates = [p for p in candidates if os.path.abspath(p) != os.path.abspath(inputPath)]
-
-        # voorkeur: bestanden die na mm_segment start zijn aangepast/geschreven
-        recent = [p for p in candidates if os.path.getmtime(p) >= (t0 - 1.0)]
-        use_list = recent if recent else candidates
-
-        if not use_list:
-            # laat stdout/stderr zien voor debugging
+        # mm_segment writes <input>_dseg.nii.gz into the output directory
+        outputs = sorted(glob.glob(os.path.join(outputDir, "*_dseg.nii*")))
+        if not outputs:
+            for ext in ("*.nii.gz", "*.nii", "*.nrrd"):
+                outputs.extend(glob.glob(os.path.join(outputDir, ext)))
+        if not outputs:
+            # keep tempDir for debugging
+            tail = "".join(output.splitlines(keepends=True)[-30:])
             raise RuntimeError(
-                f"No output volume found in {tempDir} after running mm_segment.\n\n"
-                f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}\n"
+                "mm_segment did not produce a segmentation.\n\n"
+                f"Working directory (kept for inspection): {tempDir}\n\n"
+                f"Last output lines:\n{tail}"
             )
-
-        # voorkeur: typische seg namen
-        preferred = [
-            p for p in use_list
-            if any(k in os.path.basename(p).lower() for k in ("dseg", "seg", "label", "mask"))
-        ]
-        outputPath = preferred[0] if preferred else max(use_list, key=os.path.getmtime)
-
+        outputPath = outputs[0]
         logging.info(f"[MuscleMap] Using output file: {outputPath}")
+
+        if statusCallback:
+            statusCallback("Loading the segmentation into Slicer.")
 
         labelNode = slicer.util.loadLabelVolume(outputPath)
         if not labelNode:
-            raise RuntimeError("Failed to load the MuscleMap output labelmap.")
+            raise RuntimeError(f"Failed to load the MuscleMap output labelmap: {outputPath}")
 
         # --- APPLY a real Slicer ColorTable (names+colors) ---
+        labels = []
         try:
-            colorNode = self._build_colortable_from_labels_json()
+            colorNode, labels = self._build_colortable_from_labels_json(region, model_version, output)
+        except Exception as e:
+            logging.warning(f"[MuscleMap] Could not build the label color table: {e}")
+            slicer.util.warningDisplay(
+                "The segmentation finished, but the muscle label names could not be loaded.\n"
+                "Segments will be named by their label value instead.\n\n"
+                f"Details: {e}",
+                windowTitle="MuscleMap – label names unavailable",
+            )
+            colorNode = None
 
+        # The import below takes the segment names from the labelmap's color table
+        if colorNode is not None:
             labelDisplayNode = labelNode.GetDisplayNode()
             if labelDisplayNode:
                 labelDisplayNode.SetAndObserveColorNodeID(colorNode.GetID())
-                labelDisplayNode.SetInterpolate(False)
-
             logging.info("[MuscleMap] Applied ColorTable to labelmap display.")
-        except Exception as e:
-            logging.warning(f"[MuscleMap] Could not apply JSON-based ColorTable: {e}")
-            colorNode = None
 
-        segmentationNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", "MuscleMapSegmentation")
+        segmentationNode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", f"MuscleMap_{region}_Segmentation"
+        )
         slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(labelNode, segmentationNode)
 
         segmentationNode.CreateDefaultDisplayNodes()
         segmentationNode.GetDisplayNode().SetVisibility(True)
+        # Export uses the input image geometry
+        segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(inputVolumeNode)
 
-        # Optional: apply same ColorTable to segmentation display (helps consistency)
         if colorNode is not None:
-            try:
-                segDisplay = segmentationNode.GetDisplayNode()
-                if segDisplay:
-                    segDisplay.SetAndObserveColorNodeID(colorNode.GetID())
-            except Exception:
-                pass
+            # Remember the color table so that exports keep the original
+            # MuscleMap label values instead of renumbering segments 1..N.
+            segmentationNode.SetNodeReferenceID(self.COLOR_TABLE_REFERENCE_ROLE, colorNode.GetID())
+            if hasattr(segmentationNode, "SetLabelmapConversionColorTableNodeID"):
+                segmentationNode.SetLabelmapConversionColorTableNodeID(colorNode.GetID())
+            segmentationNode.SetAttribute(self.LABELS_ATTRIBUTE, json.dumps(labels))
 
         slicer.mrmlScene.RemoveNode(labelNode)
         slicer.util.setSliceViewerLayers(background=inputVolumeNode)
 
-        slicer.util.infoDisplay("MuscleMap whole-body segmentation completed.")
+        shutil.rmtree(tempDir, ignore_errors=True)
         return segmentationNode
+
+    def defaultExportPath(self, segmentationNode) -> str:
+        """Suggest <input image folder>/<input image name>_dseg.nii.gz (MuscleMap convention)."""
+        referenceVolume = segmentationNode.GetNodeReference(
+            slicer.vtkMRMLSegmentationNode.GetReferenceImageGeometryReferenceRole()
+        )
+        directory = ""
+        baseName = segmentationNode.GetName().replace("_Segmentation", "")
+        if referenceVolume:
+            baseName = referenceVolume.GetName()
+            storageNode = referenceVolume.GetStorageNode()
+            inputFile = storageNode.GetFileName() if storageNode else None
+            if inputFile:
+                directory = os.path.dirname(inputFile)
+                baseName = os.path.basename(inputFile)
+                for ext in (".nii.gz", ".nii", ".nrrd", ".mha", ".mhd"):
+                    if baseName.lower().endswith(ext):
+                        baseName = baseName[: -len(ext)]
+                        break
+        if not directory or not os.path.isdir(directory):
+            directory = slicer.app.defaultScenePath
+        return os.path.join(directory, f"{baseName}_dseg.nii.gz")
+
+    def exportSegmentation(self, segmentationNode, labelmapPath: str):
+        """Write a NIfTI labelmap (MuscleMap label values), a CSV label table and a color table.
+
+        Returns the list of written file paths.
+        """
+        # Always write <name>_dseg.nii.gz, the MuscleMap naming convention
+        base = labelmapPath
+        for ext in (".nii.gz", ".nii"):
+            if base.lower().endswith(ext):
+                base = base[: -len(ext)]
+                break
+        if not base.lower().endswith("_dseg"):
+            base += "_dseg"
+        labelmapPath = base + ".nii.gz"
+
+        colorNode = segmentationNode.GetNodeReference(self.COLOR_TABLE_REFERENCE_ROLE)
+        referenceVolume = segmentationNode.GetNodeReference(
+            slicer.vtkMRMLSegmentationNode.GetReferenceImageGeometryReferenceRole()
+        )
+        extentMode = (
+            slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
+            if referenceVolume
+            else slicer.vtkSegmentation.EXTENT_UNION_OF_EFFECTIVE_SEGMENTS
+        )
+
+        segmentIds = vtk.vtkStringArray()
+        segmentationNode.GetSegmentation().GetSegmentIDs(segmentIds)
+
+        segmentationsLogic = slicer.modules.segmentations.logic()
+        labelmapNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "MuscleMapExport")
+        written = []
+        try:
+            exportedWithColorTable = False
+            if colorNode is not None:
+                try:
+                    ok = segmentationsLogic.ExportSegmentsToLabelmapNode(
+                        segmentationNode, segmentIds, labelmapNode, referenceVolume, extentMode, colorNode
+                    )
+                    exportedWithColorTable = True
+                except TypeError:
+                    # Older Slicer without the colorTableNode argument: remap below
+                    ok = segmentationsLogic.ExportSegmentsToLabelmapNode(
+                        segmentationNode, segmentIds, labelmapNode, referenceVolume, extentMode
+                    )
+            else:
+                ok = segmentationsLogic.ExportSegmentsToLabelmapNode(
+                    segmentationNode, segmentIds, labelmapNode, referenceVolume, extentMode
+                )
+            if not ok:
+                raise RuntimeError("Slicer could not convert the segmentation to a labelmap.")
+
+            if colorNode is not None and not exportedWithColorTable:
+                self._remapToColorTableValues(segmentationNode, segmentIds, labelmapNode, colorNode)
+
+            if not slicer.util.saveNode(labelmapNode, labelmapPath):
+                raise RuntimeError(f"Failed to write {labelmapPath}")
+            written.append(labelmapPath)
+        finally:
+            slicer.mrmlScene.RemoveNode(labelmapNode)
+
+        csvPath = base + "_labels.csv"
+        labelsJson = segmentationNode.GetAttribute(self.LABELS_ATTRIBUTE)
+        if labelsJson:
+            labels = sorted(json.loads(labelsJson), key=lambda x: int(x["value"]))
+            with open(csvPath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["value", "region", "anatomy", "side"])
+                for item in labels:
+                    writer.writerow([item["value"], item.get("region", ""), item.get("anatomy", ""), item.get("side", "")])
+            written.append(csvPath)
+        elif colorNode is not None:
+            with open(csvPath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["value", "label"])
+                for value in range(colorNode.GetNumberOfColors()):
+                    name = colorNode.GetColorName(value)
+                    if name and name != "background":
+                        writer.writerow([value, name])
+            written.append(csvPath)
+
+        if colorNode is not None:
+            ctblPath = base + ".ctbl"
+            if slicer.util.saveNode(colorNode, ctblPath):
+                written.append(ctblPath)
+            else:
+                logging.warning(f"[MuscleMap] Could not write color table to {ctblPath}")
+
+        logging.info("[MuscleMap] Exported: " + ", ".join(written))
+        return written
+
+    def _remapToColorTableValues(self, segmentationNode, segmentIds, labelmapNode, colorNode):
+        """Replace the consecutive export values (1..N) by the color table values of the segment names."""
+        import numpy as np
+
+        segmentation = segmentationNode.GetSegmentation()
+        exported = slicer.util.arrayFromVolume(labelmapNode)
+        remapped = np.zeros_like(exported)
+        for i in range(segmentIds.GetNumberOfValues()):
+            segment = segmentation.GetSegment(segmentIds.GetValue(i))
+            value = colorNode.GetColorIndexByName(segment.GetName())
+            if value < 0:
+                logging.warning(f"[MuscleMap] Segment '{segment.GetName()}' not in color table, label value kept as {i + 1}.")
+                value = i + 1
+            remapped[exported == (i + 1)] = value
+        slicer.util.updateVolumeFromArray(labelmapNode, remapped)

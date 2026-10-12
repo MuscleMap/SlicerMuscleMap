@@ -23,10 +23,23 @@ If you have a GPU available and installed then whole-body segmentation can be co
     - Example open-source to test the model can be found --for example-- at [MyoSegmentum thigh ](https://osf.io/svwa7/?view_only=c2c980c17b3a40fca35d088a3cdd83e2) or [MyoSegmentum Spine ](https://osf.io/3j54b/?view-only=f5089274d4a449cda2fef1d2df0ecc56). Dependent on the availability of a GPU and image size, segmentation may a few seconds up to a minute to segment the image. 
 - When this module is used for the first time, please first download and install Pytorch and MuscleMap dependencies by clicking on the button ('Install MuscleMap dependencies'). This can take several minutes. 
     - You may get an error popup: Failed to compute results ... Command ... 'pip', 'install' ... returned non-zero exit status 1. This may be normal, see what to do in Troubleshooting section
-- When dependencies are succesfully installed, click on the button ('Run MuscleMap Segmentation'). 
+- Select the model under *Inputs*:
+    - **Model**: `wholebody` (default) or a regional model (`abdomen`, `pelvis`, `thigh`, `leg`, `forearm`). The list is read from the installed MuscleMap package.
+    - **Model version**: `latest` (default) always uses the newest version published on Zenodo; a specific version can be selected for reproducibility.
+    - The first run of a model downloads it from Zenodo and caches it; this can take a while.
+- When dependencies are succesfully installed, click on the button ('Run MuscleMap Segmentation'). The run can be cancelled from the progress dialog.
     - Expected computation time:
         - With CUDA-capable GPU: 3 seconds to 1 minute, dependent on image resolution and size. 
         - Without GPU: 1 minute to 20 minutes, dependent on image resolution and size. 
+- The resulting segmentation has the MuscleMap muscle names and colours.
+- **Export segmentation...** (under *Outputs*) writes three files next to each other (the `_dseg` suffix is always added):
+    - `<name>_dseg.nii.gz`: labelmap with the original MuscleMap label values (e.g. 1101 for levator scapulae left), not renumbered 1, 2, 3, ...
+    - `<name>_dseg_labels.csv`: label value, region, anatomy and side.
+    - `<name>_dseg.ctbl`: 3D Slicer color table with names and colours.
+- *Advanced*: force CPU, lower sliding-window overlap (faster), and **Remember settings** to restore the selected model, version and options on the next start of Slicer.
+
+### Version
+The extension version is shown in the module help panel (SlicerMuscleMap version). Please mention it when reporting an issue. Releases are tagged in this repository (`v<version>`); the Slicer Extensions Manager builds from the `main` branch.
 
 ### Contact
 
